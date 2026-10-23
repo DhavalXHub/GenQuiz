@@ -1,0 +1,44 @@
+# Environment variables and secrets
+.env
+*.env
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Streamlit runtime
+.streamlit/secrets.toml
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+# Local AI model adapters and checkpoints
+fine_tuned_adapter/
+genquiz_lora_adapter/
+genquiz_checkpoints/
+
+# Model weights
+*.safetensors
+*.bin
+
+# Training reports and generated files
+reports/
+
+# Other virtual environments
+.venv/
+
+# Local model archives
+*.zip
+
+# Local datasets, if they contain data you don't want public
+genquiz_dataset_original_backup.csv
+genquiz_dataset.csv
