@@ -224,7 +224,9 @@ def test_question_count_and_type_breakdown_validation():
 def test_rule_based_adaptive_recommendation():
     """Verify that weak topics trigger targeted follow-up quiz recommendations."""
     q1 = GeneratedQuestion(
-        question_id="Q1", question="Q1", question_type="True/False",
+        question_id="Q1",
+        question="What does LoRA stand for in the context of model fine-tuning?",
+        question_type="True/False",
         correct_answer="True", explanation="E1", topic="LoRA", difficulty="Medium"
     )
     quiz = GeneratedQuiz(

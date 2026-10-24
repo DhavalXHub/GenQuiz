@@ -24,7 +24,7 @@ load_dotenv(override=True)
 from dataset import DatasetManager
 from pdf_processor import extract_text_from_pdf, prioritize_topic_passages
 from llm_service import LLMService, mask_secret
-from quiz_generator import QuizGenerator, parse_user_prompt, GeneratedQuiz
+from quiz_generator import QuizGenerator, parse_user_prompt, GeneratedQuiz, TopicMismatchError
 from quiz_evaluator import QuizEvaluator
 from export_utils import generate_assessment_pdf
 
@@ -386,17 +386,34 @@ with tab_quiz:
         generator = QuizGenerator(st.session_state.dataset_manager, llm_service)
         run_force_demo = (not is_live_requested)
 
+        progress_info = st.empty()
+        def ui_progress(batch_num: int, total_batches: int, msg: str):
+            progress_info.info(f"⚡ **{msg}**")
+
         with st.spinner("Analyzing document, matching topic-relevant passages, and formulating questions..."):
             try:
                 generated_quiz = generator.generate_quiz(
                     pdf_text_or_dict=st.session_state.extracted_pdf_data,
                     user_prompt=st.session_state.prompt_input,
-                    force_demo=run_force_demo
+                    force_demo=run_force_demo,
+                    progress_callback=ui_progress,
                 )
+                progress_info.empty()
                 st.session_state.quiz = generated_quiz
                 st.session_state.evaluation = None
                 st.session_state.user_answers = {}
                 st.success("🎉 Quiz formulated and validated successfully!")
+            except TopicMismatchError as tme:
+                st.error(
+                    f"⚠️ **Topic Mismatch Detected!**\n\n"
+                    f"{tme.warning}\n\n"
+                    "**Policy**: Questions in PDF-Grounded mode must be grounded in the source document. "
+                    f"The requested topic '{tme.topic}' was not found in the uploaded PDF.\n\n"
+                    "**How to proceed:**\n"
+                    f"1. **Upload a matching document:** Upload a PDF that covers '{tme.topic}'.\n"
+                    "2. **Update your prompt:** Change your prompt to match the content of the current document.\n"
+                    "3. **Use Demo Mode:** Select 'Demo Mode' in the sidebar to view verified seed dataset questions on this topic without PDF grounding."
+                )
             except Exception as ex:
                 st.error(f"Generation error: {str(ex)}")
 

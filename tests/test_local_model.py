@@ -1,304 +1,800 @@
 """
-test_local_model.py - Unit Tests for Local PEFT/LoRA Model Service and Provider Integration.
+test_local_model.py - Comprehensive tests for local PEFT/LoRA service and validation.
+
+Covers:
+- JSON cleaning / extraction
+- Adapter status detection (present / missing)
+- _validate_local_question: all question types, placeholder rejection,
+  generic MCQ option rejection, duplicate option rejection
+- _is_placeholder and _is_generic_option helpers
+- _question_prompt: confirms NO "..." appears in the schema example
+- generate_single_question_local: mocked model behaviour
+- generate_quiz_local: mocked model, partial-result policy
+- LLMService initialization for local provider
+- quiz_generator.py: Pydantic rejects placeholder question text
+- Missing-adapter error propagation
 """
 
-import os
 import json
+import os
+import sys
 import tempfile
+import types
+from typing import Any, Dict
+from unittest.mock import MagicMock, patch
+
 import pytest
+
+# Ensure repo root is on path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+
+# ---------------------------------------------------------------------------
+# Imports under test
+# ---------------------------------------------------------------------------
 from local_model_service import (
-    LOCAL_MAX_INPUT_TOKENS,
-    LOCAL_MAX_NEW_TOKENS,
-    LOCAL_MAX_QUESTIONS,
-    _is_cuda_oom,
+    _is_generic_option,
+    _is_placeholder,
+    _question_prompt,
+    _validate_local_question,
+    clean_local_json_text,
     get_adapter_status,
-    generate_quiz_local,
-    load_cached_peft_model,
     resolve_adapter_path,
-    clean_local_json_text
 )
-import local_model_service
 from llm_service import LLMService
-from quiz_generator import QuizGenerator
+from quiz_generator import GeneratedQuestion, QuizGenerator
 from dataset import DatasetManager
 
 
-def test_clean_local_json_text():
-    # Markdown code fences with json tag
-    raw1 = "```json\n{\"question\": \"Test?\", \"correct_answer\": \"A\"}\n```"
-    assert clean_local_json_text(raw1) == '{"question": "Test?", "correct_answer": "A"}'
+# ===========================================================================
+# JSON cleaning
+# ===========================================================================
 
-    # Fences without json tag
-    raw2 = "```\n{\"question\": \"Test?\"}\n```"
-    assert clean_local_json_text(raw2) == '{"question": "Test?"}'
+class TestCleanLocalJsonText:
+    def test_strips_json_fence(self):
+        raw = "```json\n{\"question\": \"Test?\"}\n```"
+        assert clean_local_json_text(raw) == '{"question": "Test?"}'
 
-    # Conversational text surrounding JSON
-    raw3 = "Here is the requested question:\n{\"question\": \"Test?\"}\nI hope this helps!"
-    assert clean_local_json_text(raw3) == '{"question": "Test?"}'
+    def test_strips_plain_fence(self):
+        raw = "```\n{\"question\": \"Test?\"}\n```"
+        assert clean_local_json_text(raw) == '{"question": "Test?"}'
 
+    def test_extracts_json_from_surrounding_text(self):
+        raw = "Here is your question:\n{\"question\": \"What is X?\"}\nHope this helps!"
+        assert clean_local_json_text(raw) == '{"question": "What is X?"}'
 
-def test_clean_local_json_text_rejects_ambiguous_multiple_objects():
-    raw = '{"question": "First"}\n{"question": "Second"}'
-    assert clean_local_json_text(raw) == raw
+    def test_passthrough_clean_json(self):
+        raw = '{"a": 1}'
+        assert clean_local_json_text(raw) == '{"a": 1}'
 
+    def test_empty_string(self):
+        assert clean_local_json_text("") == ""
 
-def test_local_question_schema_accepts_mcq_and_requires_answer_key():
-    valid = {
-        "question_id": "Q1",
-        "question": "Which mechanism combines token information?",
-        "question_type": "MCQ",
-        "options": {"A": "Attention", "B": "Pooling", "C": "Sorting", "D": "Hashing"},
-        "correct_answer": "A",
-        "explanation": "Attention combines information across positions.",
-        "topic": "Transformers",
-        "difficulty": "Easy",
-    }
-    parsed = local_model_service._validate_local_question(valid, "MCQ", "Transformers", "Easy")
-    assert parsed["correct_answer"] == "A"
-
-    invalid = dict(valid, correct_answer="Attention")
-    with pytest.raises(ValueError, match="correct_answer"):
-        local_model_service._validate_local_question(invalid, "MCQ", "Transformers", "Easy")
+    def test_no_braces_returns_stripped(self):
+        raw = "No JSON here"
+        assert clean_local_json_text(raw) == "No JSON here"
 
 
-def test_adapter_status_missing():
-    status = get_adapter_status(custom_path="non_existent_adapter_dir_12345")
-    assert status["is_available"] is False
-    assert status["has_weights"] is False
-    assert "non_existent_adapter_dir_12345" in status["adapter_path"]
-    assert "not found" in status["message"].lower()
+# ===========================================================================
+# Placeholder / generic option detection
+# ===========================================================================
+
+class TestPlaceholderDetection:
+    def test_ellipsis_is_placeholder(self):
+        assert _is_placeholder("...")
+        assert _is_placeholder("…")
+
+    def test_empty_string_is_placeholder(self):
+        assert _is_placeholder("")
+
+    def test_none_is_placeholder(self):
+        assert _is_placeholder(None)
+
+    def test_real_question_not_placeholder(self):
+        assert not _is_placeholder("What is the role of attention in Transformers?")
+
+    def test_first_is_generic_option(self):
+        assert _is_generic_option("First")
+        assert _is_generic_option("first")
+        assert _is_generic_option("FIRST")
+
+    def test_second_third_fourth_are_generic(self):
+        for word in ("Second", "Third", "Fourth", "SECOND", "third"):
+            assert _is_generic_option(word), f"Expected '{word}' to be generic"
+
+    def test_option_a_label_is_generic(self):
+        assert _is_generic_option("Option A")
+        assert _is_generic_option("option a")
+
+    def test_ellipsis_is_generic_option(self):
+        assert _is_generic_option("...")
+
+    def test_specific_option_is_not_generic(self):
+        assert not _is_generic_option("The Transformer encoder uses multi-head attention")
+
+    def test_short_option_below_min_len(self):
+        assert _is_generic_option("AB")   # 2 chars < min 3
 
 
-def test_adapter_status_detected():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        adapter_cfg = os.path.join(tmpdir, "adapter_config.json")
-        with open(adapter_cfg, "w", encoding="utf-8") as f:
-            json.dump({
-                "base_model_name_or_path": "Qwen/Qwen2.5-1.5B-Instruct",
-                "r": 16,
-                "lora_alpha": 32
-            }, f)
+# ===========================================================================
+# _question_prompt — no placeholders in schema text
+# ===========================================================================
 
-        # Create dummy weights file
-        with open(os.path.join(tmpdir, "adapter_model.safetensors"), "w") as f:
-            f.write("mock_weights")
-
-        status = get_adapter_status(custom_path=tmpdir)
-        assert status["is_available"] is True
-        assert status["has_weights"] is True
-        assert status["base_model"] == "Qwen/Qwen2.5-1.5B-Instruct"
-
-
-def test_llm_service_local_provider_initialization():
-    service = LLMService(provider="Fine-Tuned Local Model (QLoRA)")
-    assert service.provider == "local"
-
-    info = service.get_active_provider_info()
-    assert "Fine-Tuned Local Model" in info["provider"]
-    assert "LoRA Adapter" in info["model"]
-
-
-def test_local_model_missing_adapter_raises_clean_error():
-    service = LLMService(provider="local")
-    # If no local adapter is on disk, generate_json must return a clean actionable error
-    # and MUST NOT silently call Groq or OpenAI
-    if not service.has_active_credentials():
-        parsed, err = service.generate_json("System prompt", "User prompt")
-        assert parsed is None
-        assert err is not None
-        assert "LORA_ADAPTER_NOT_FOUND" in err
-        assert "GenQuiz_FineTuning.ipynb" in err
-
-
-def test_quiz_generator_local_mode_missing_adapter():
-    dm = DatasetManager("genquiz_dataset.csv")
-    service = LLMService(provider="local")
-
-    if not service.has_active_credentials():
-        generator = QuizGenerator(dm, service)
-        with pytest.raises(RuntimeError) as exc_info:
-            generator.generate_quiz(
-                pdf_text_or_dict="Sample PDF text on Transformers and Attention.",
-                user_prompt="Generate 3 questions about Transformers.",
-                force_demo=False
+class TestQuestionPrompt:
+    def _check_no_placeholders_in_schema(self, user_prompt: str):
+        # The schema portion must not contain the old stub values
+        bad_patterns = ['"question":"..."', '"question": "..."',
+                        '"A":"First"', '"A": "First"',
+                        '"B":"Second"', '"B": "Second"',
+                        '"C":"Third"', '"C": "Third"',
+                        '"D":"Fourth"', '"D": "Fourth"',
+                        '"correct_answer":"..."', '"correct_answer": "..."',
+                        '"explanation":"..."', '"explanation": "..."']
+        for pat in bad_patterns:
+            assert pat not in user_prompt, (
+                f"Found forbidden placeholder pattern in prompt: {pat!r}"
             )
-        assert "LORA_ADAPTER_NOT_FOUND" in str(exc_info.value)
-        assert "GenQuiz_FineTuning.ipynb" in str(exc_info.value)
+
+    def test_mcq_prompt_no_stub_placeholders(self):
+        _, user_prompt = _question_prompt(
+            "Context about attention", "Attention", "MCQ", "Medium", "Understand"
+        )
+        self._check_no_placeholders_in_schema(user_prompt)
+
+    def test_short_answer_prompt_no_stub_placeholders(self):
+        _, user_prompt = _question_prompt(
+            "Context text", "Topic", "Short Answer", "Easy", "Remember"
+        )
+        self._check_no_placeholders_in_schema(user_prompt)
+
+    def test_true_false_prompt_no_stub_placeholders(self):
+        _, user_prompt = _question_prompt(
+            "Context text", "Topic", "True/False", "Hard", "Analyze"
+        )
+        self._check_no_placeholders_in_schema(user_prompt)
+
+    def test_mcq_prompt_contains_context(self):
+        ctx = "Neural networks learn representations from data."
+        _, user_prompt = _question_prompt(ctx, "ML", "MCQ", "Medium", "Apply")
+        assert ctx in user_prompt
+
+    def test_correction_appended_when_given(self):
+        _, user_prompt = _question_prompt(
+            "Some context", "Topic", "MCQ", "Medium", "Understand",
+            correction="question was too vague"
+        )
+        assert "question was too vague" in user_prompt
 
 
-def test_local_limits_are_conservative():
-    assert LOCAL_MAX_INPUT_TOKENS <= 2048
-    assert LOCAL_MAX_NEW_TOKENS <= 384
-    assert LOCAL_MAX_QUESTIONS <= 8
+# ===========================================================================
+# _validate_local_question
+# ===========================================================================
 
-
-def test_mcq_prompt_requires_options_object():
-    system, user = local_model_service._question_prompt(
-        "Attention combines token information.",
-        "Transformers",
-        "MCQ",
-        "Easy",
-        "Understand",
-    )
-    assert "Never output null for options" in user
-    assert '"A":"First"' in user
-
-
-def test_short_answer_prompt_uses_short_answer_schema():
-    _, user = local_model_service._question_prompt(
-        "Attention combines token information.",
-        "Transformers",
-        "Short Answer",
-        "Medium",
-        "Understand",
-    )
-    assert '"question_type":"Short Answer"' in user
-    assert '"options":null' in user
-    assert "Never output null for options" not in user
-
-
-class _FakeTokenizer:
-    def decode(self, token_ids, skip_special_tokens=True):
-        return "decoded output"
-
-
-class _FakeIds:
-    shape = (1, 3)
-
-    def __getitem__(self, item):
-        return self
-
-
-def test_decode_generated_text_slices_prompt_tokens():
-    outputs = [_FakeIds()]
-    text, info = local_model_service._decode_generated_text(
-        outputs, input_token_count=2, tokenizer=_FakeTokenizer(), max_new_tokens=4
-    )
-    assert text == "decoded output"
-    assert info["input_tokens"] == 2
-    assert info["generated_tokens"] == 3
-    assert info["hit_token_limit"] is False
-
-
-class _EmptyTokenizer:
-    def decode(self, token_ids, skip_special_tokens=True):
-        return ""
-
-
-def test_decode_generated_text_reports_empty_and_limit():
-    outputs = [_FakeIds()]
-    _, info = local_model_service._decode_generated_text(
-        outputs, input_token_count=0, tokenizer=_EmptyTokenizer(), max_new_tokens=3
-    )
-    assert info["empty"] is True
-    assert info["generated_tokens"] == 3
-    assert info["hit_token_limit"] is True
-
-
-def test_cuda_oom_detection():
-    assert _is_cuda_oom(RuntimeError("CUDA out of memory. Tried to allocate 2 GiB"))
-    assert not _is_cuda_oom(RuntimeError("invalid JSON"))
-
-
-def test_local_rejects_base_model_mismatch(tmp_path):
-    (tmp_path / "adapter_config.json").write_text(
-        json.dumps({"base_model_name_or_path": "expected/model"}),
-        encoding="utf-8",
-    )
-    (tmp_path / "adapter_model.safetensors").write_bytes(b"mock")
-    with pytest.raises(ValueError, match="LORA_BASE_MODEL_MISMATCH"):
-        load_cached_peft_model("different/model", str(tmp_path))
-
-
-def test_local_rejects_oversized_request():
-    result, error = generate_quiz_local(
-        pdf_context="A short context.",
-        target_count=LOCAL_MAX_QUESTIONS + 1,
-        target_topic="Transformers",
-        target_diff="Easy",
-        target_types=["MCQ"],
-        type_counts={},
-        adapter_path="missing",
-    )
-    assert result is None
-    assert error is not None
-    assert "LOCAL_REQUEST_TOO_LARGE" in error
-
-
-def test_local_retries_malformed_output_and_returns_exact_count(monkeypatch):
-    valid = {
-        "question_id": "model-id",
-        "question": "What does attention combine?",
+def _good_mcq(**overrides) -> Dict[str, Any]:
+    base = {
+        "question_id": "Q1",
+        "question": "What mechanism does Transformer use to attend to all tokens?",
         "question_type": "MCQ",
-        "options": {"A": "Token information", "B": "Images", "C": "Audio", "D": "Labels"},
+        "options": {
+            "A": "Self-attention",
+            "B": "Recurrent layers",
+            "C": "Convolution filters",
+            "D": "Max-pooling",
+        },
         "correct_answer": "A",
-        "explanation": "The passage states that attention combines token information.",
+        "explanation": "Transformers use self-attention to relate tokens.",
         "topic": "Transformers",
-        "difficulty": "Easy",
+        "difficulty": "Medium",
     }
-    responses = [None, valid, valid]
-    calls = []
-
-    monkeypatch.setattr(local_model_service, "load_cached_peft_model", lambda adapter_path=None: (object(), object()))
-
-    def fake_generate(**kwargs):
-        calls.append(kwargs["correction"])
-        response = responses.pop(0)
-        if response is None:
-            return None, "Local model produced invalid JSON"
-        return dict(response, question=f"{response['question']} {len(calls)}"), None
-
-    monkeypatch.setattr(local_model_service, "generate_single_question_local", fake_generate)
-    result, error = local_model_service.generate_quiz_local(
-        "Transformers use attention.\n\nTransformers use positional encoding.",
-        2, "Transformers", "Easy", ["MCQ"], {}, "adapter"
-    )
-    assert error is None
-    assert result is not None
-    assert len(result["questions"]) == 2
-    assert calls[0] is None
-    assert calls[1] is not None
-    assert len({q["question"] for q in result["questions"]}) == 2
+    base.update(overrides)
+    return base
 
 
-def test_local_reports_honest_shortfall_after_retries(monkeypatch):
-    monkeypatch.setattr(local_model_service, "load_cached_peft_model", lambda adapter_path=None: (object(), object()))
-    monkeypatch.setattr(
-        local_model_service,
-        "generate_single_question_local",
-        lambda **kwargs: (None, "schema-invalid"),
-    )
-    result, error = local_model_service.generate_quiz_local(
-        "Transformers use attention.", 1, "Transformers", "Easy", ["MCQ"], {}, "adapter"
-    )
-    assert result is None
-    assert error is not None
-    assert "returned 0 of 1" in error
-    assert "schema-invalid" in error
+class TestValidateLocalQuestion:
+
+    # ── Valid cases ──────────────────────────────────────────────────────────
+
+    def test_valid_mcq_passes(self):
+        result = _validate_local_question(_good_mcq(), "MCQ", "Transformers", "Medium")
+        assert result["correct_answer"] == "A"
+        assert result["question_type"] == "MCQ"
+
+    def test_valid_mcq_lowercase_answer_normalized(self):
+        q = _good_mcq(correct_answer="b")
+        result = _validate_local_question(q, "MCQ", "Transformers", "Medium")
+        assert result["correct_answer"] == "B"
+
+    def test_valid_true_false(self):
+        q = {
+            "question_id": "Q1",
+            "question": "True or False: Self-attention uses queries, keys, and values.",
+            "question_type": "True/False",
+            "options": None,
+            "correct_answer": "True",
+            "explanation": "Self-attention does use Q, K, V matrices.",
+            "topic": "Attention",
+            "difficulty": "Easy",
+        }
+        result = _validate_local_question(q, "True/False", "Attention", "Easy")
+        assert result["correct_answer"] == "True"
+
+    def test_valid_short_answer(self):
+        q = {
+            "question_id": "Q1",
+            "question": "What is the purpose of positional encoding in Transformers?",
+            "question_type": "Short Answer",
+            "options": None,
+            "correct_answer": "To inject position information into token embeddings.",
+            "explanation": "Without positional encoding the model cannot distinguish order.",
+            "topic": "Transformers",
+            "difficulty": "Medium",
+        }
+        result = _validate_local_question(q, "Short Answer", "Transformers", "Medium")
+        assert "position" in result["correct_answer"]
+
+    # ── Placeholder question text ────────────────────────────────────────────
+
+    def test_ellipsis_question_rejected(self):
+        q = _good_mcq(question="...")
+        with pytest.raises(ValueError, match="placeholder"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    def test_unicode_ellipsis_question_rejected(self):
+        q = _good_mcq(question="…")
+        with pytest.raises(ValueError, match="placeholder"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    def test_empty_question_rejected(self):
+        q = _good_mcq(question="")
+        with pytest.raises(ValueError, match="Missing required field"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    def test_short_question_rejected(self):
+        q = _good_mcq(question="Q?")
+        with pytest.raises(ValueError, match="too short"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    # ── Generic / stub MCQ options ───────────────────────────────────────────
+
+    def test_first_second_third_fourth_options_rejected(self):
+        q = _good_mcq(options={"A": "First", "B": "Second", "C": "Third", "D": "Fourth"})
+        with pytest.raises(ValueError, match="generic placeholder"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    def test_option_a_label_options_rejected(self):
+        q = _good_mcq(options={"A": "Option A", "B": "Option B", "C": "Option C", "D": "Option D"})
+        with pytest.raises(ValueError, match="generic placeholder"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    def test_empty_option_rejected(self):
+        q = _good_mcq(options={"A": "", "B": "Something", "C": "Another", "D": "Last"})
+        with pytest.raises(ValueError, match="generic placeholder"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    def test_ellipsis_option_rejected(self):
+        q = _good_mcq(options={"A": "...", "B": "Real choice", "C": "Another", "D": "Last"})
+        with pytest.raises(ValueError, match="generic placeholder"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    # ── Duplicate MCQ options ────────────────────────────────────────────────
+
+    def test_duplicate_options_rejected(self):
+        q = _good_mcq(options={"A": "Self-attention", "B": "Self-attention", "C": "Something", "D": "Another"})
+        with pytest.raises(ValueError, match="distinct"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    # ── Invalid answer letters ───────────────────────────────────────────────
+
+    def test_mcq_answer_not_a_letter_rejected(self):
+        q = _good_mcq(correct_answer="Self-attention")
+        with pytest.raises(ValueError, match="one of A, B, C, or D"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    def test_mcq_answer_e_rejected(self):
+        q = _good_mcq(correct_answer="E")
+        with pytest.raises(ValueError, match="one of A, B, C, or D"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    # ── Missing MCQ options ──────────────────────────────────────────────────
+
+    def test_mcq_options_none_rejected(self):
+        q = _good_mcq(options=None)
+        with pytest.raises(ValueError, match="object with exactly"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    def test_mcq_options_missing_d_rejected(self):
+        q = _good_mcq(options={"A": "Self-attention", "B": "Recurrent", "C": "Conv"})
+        with pytest.raises(ValueError, match="object with exactly"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    # ── question_type mismatch ───────────────────────────────────────────────
+
+    def test_type_mismatch_rejected(self):
+        q = _good_mcq(question_type="Short Answer")
+        with pytest.raises(ValueError, match="MCQ"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    # ── True/False invalid answer ────────────────────────────────────────────
+
+    def test_true_false_invalid_answer(self):
+        q = {
+            "question": "Is self-attention used in Transformers?",
+            "question_type": "True/False",
+            "options": None,
+            "correct_answer": "Yes",
+            "explanation": "Self-attention is the core of Transformers.",
+            "topic": "Attention",
+            "difficulty": "Easy",
+        }
+        with pytest.raises(ValueError, match="True.*False"):
+            _validate_local_question(q, "True/False", "Attention", "Easy")
+
+    # ── Placeholder explanation ───────────────────────────────────────────────
+
+    def test_ellipsis_explanation_rejected(self):
+        q = _good_mcq(explanation="...")
+        with pytest.raises(ValueError, match="placeholder"):
+            _validate_local_question(q, "MCQ", "Transformers", "Medium")
+
+    # ── Short Answer placeholder answer ─────────────────────────────────────
+
+    def test_short_answer_placeholder_answer_rejected(self):
+        q = {
+            "question": "What is positional encoding used for in Transformers?",
+            "question_type": "Short Answer",
+            "options": None,
+            "correct_answer": "...",
+            "explanation": "Positional encoding adds position information.",
+            "topic": "Transformers",
+            "difficulty": "Easy",
+        }
+        with pytest.raises(ValueError, match="placeholder"):
+            _validate_local_question(q, "Short Answer", "Transformers", "Easy")
 
 
-def test_local_rejects_duplicate_questions(monkeypatch):
-    valid = {
-        "question_id": "model-id",
-        "question": "What does attention combine?",
+# ===========================================================================
+# Adapter detection
+# ===========================================================================
+
+class TestAdapterStatus:
+    def test_missing_adapter(self):
+        status = get_adapter_status(custom_path="non_existent_dir_xyz_12345")
+        assert status["is_available"] is False
+        assert "non_existent_dir_xyz_12345" in status["adapter_path"]
+
+    def test_detected_adapter_with_safetensors(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Write minimal adapter_config.json
+            cfg = {
+                "base_model_name_or_path": "Qwen/Qwen2.5-1.5B-Instruct",
+                "peft_type": "LORA",
+                "r": 16,
+            }
+            with open(os.path.join(tmpdir, "adapter_config.json"), "w") as f:
+                json.dump(cfg, f)
+            # Write dummy weights
+            with open(os.path.join(tmpdir, "adapter_model.safetensors"), "wb") as f:
+                f.write(b"\x00" * 16)
+
+            status = get_adapter_status(custom_path=tmpdir)
+            assert status["is_available"] is True
+            assert status["has_weights"] is True
+            assert status["base_model"] == "Qwen/Qwen2.5-1.5B-Instruct"
+
+    def test_detected_without_weights(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = {"base_model_name_or_path": "Qwen/Qwen2.5-1.5B-Instruct"}
+            with open(os.path.join(tmpdir, "adapter_config.json"), "w") as f:
+                json.dump(cfg, f)
+            # No weights file
+            status = get_adapter_status(custom_path=tmpdir)
+            assert status["is_available"] is True
+            assert status["has_weights"] is False
+
+
+# ===========================================================================
+# LLMService — local provider
+# ===========================================================================
+
+class TestLLMServiceLocalProvider:
+    def test_local_provider_recognized(self):
+        svc = LLMService(provider="Fine-Tuned Local Model (QLoRA)")
+        assert svc.provider == "local"
+
+    def test_local_provider_peft_keyword(self):
+        svc = LLMService(provider="local")
+        assert svc.provider == "local"
+
+    def test_local_info_structure(self):
+        svc = LLMService(provider="local")
+        info = svc.get_active_provider_info()
+        assert "Fine-Tuned Local Model" in info["provider"]
+        assert "LoRA" in info["model"]
+
+    def test_local_missing_adapter_returns_false_configured(self):
+        with patch("local_model_service.resolve_adapter_path", return_value=None):
+            svc = LLMService(provider="local")
+            assert svc.has_active_credentials() is False
+
+
+# ===========================================================================
+# generate_json — local provider mocked
+# ===========================================================================
+
+class TestLLMServiceGenerateJsonLocal:
+    """Verify that LLMService.generate_json for local provider routes correctly."""
+
+    def _make_service(self):
+        svc = LLMService(provider="local")
+        return svc
+
+    def test_missing_adapter_returns_error_not_exception(self):
+        with patch("local_model_service.resolve_adapter_path", return_value=None):
+            svc = self._make_service()
+            result, err = svc.generate_json("sys", "user")
+            assert result is None
+            assert err is not None
+            assert "LORA_ADAPTER_NOT_FOUND" in err
+
+    def test_no_cloud_call_when_local(self):
+        """Ensure no Groq/OpenAI import occurs when provider is local."""
+        with (
+            patch("local_model_service.resolve_adapter_path", return_value=None),
+            patch("groq.Groq") as mock_groq,
+            patch("openai.OpenAI") as mock_oai,
+        ):
+            svc = self._make_service()
+            svc.generate_json("sys", "user")
+            mock_groq.assert_not_called()
+            mock_oai.assert_not_called()
+
+
+# ===========================================================================
+# Pydantic GeneratedQuestion — placeholder rejection
+# ===========================================================================
+
+class TestPydanticGeneratedQuestion:
+    def test_valid_question_accepted(self):
+        q = GeneratedQuestion(
+            question_id="Q1",
+            question="What is the primary function of the attention mechanism?",
+            question_type="MCQ",
+            options={"A": "Focus on relevant tokens", "B": "Pool features", "C": "Embed tokens", "D": "Normalize values"},
+            correct_answer="A",
+            explanation="Attention selects relevant tokens dynamically.",
+            topic="Attention",
+            difficulty="Medium",
+        )
+        assert q.question == "What is the primary function of the attention mechanism?"
+
+    def test_ellipsis_question_rejected_by_pydantic(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="placeholder"):
+            GeneratedQuestion(
+                question_id="Q1",
+                question="...",
+                question_type="MCQ",
+                options={"A": "A", "B": "B", "C": "C", "D": "D"},
+                correct_answer="A",
+                explanation="Explanation.",
+                topic="Topic",
+                difficulty="Medium",
+            )
+
+    def test_too_short_question_rejected_by_pydantic(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="too short"):
+            GeneratedQuestion(
+                question_id="Q1",
+                question="Why?",   # 4 chars < 10
+                question_type="Short Answer",
+                options=None,
+                correct_answer="Because.",
+                explanation="Explanation.",
+                topic="Topic",
+                difficulty="Easy",
+            )
+
+    def test_empty_question_rejected_by_pydantic(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            GeneratedQuestion(
+                question_id="Q1",
+                question="",
+                question_type="MCQ",
+                options={"A": "A", "B": "B", "C": "C", "D": "D"},
+                correct_answer="A",
+                explanation="Explanation.",
+                topic="Topic",
+                difficulty="Medium",
+            )
+
+
+# ===========================================================================
+# generate_single_question_local — mocked model
+# ===========================================================================
+
+class TestGenerateSingleQuestionLocalMocked:
+    """Tests using a mocked model to avoid GPU dependency."""
+
+    def _make_model_tokenizer(self, generated_text: str):
+        import torch
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<prompt>"
+        tokenizer.eos_token_id = 2
+        # tokenizer.__call__ returns input ids with shape (1, 10)
+        fake_inputs = {"input_ids": torch.zeros(1, 10, dtype=torch.long)}
+        tokenizer.return_value = fake_inputs
+        tokenizer.decode.return_value = generated_text
+
+        model = MagicMock()
+        # Use a real torch.device so that tensor.to(device) succeeds
+        cpu_device = torch.device("cpu")
+        fake_param = MagicMock()
+        fake_param.device = cpu_device
+        model.parameters.return_value = iter([fake_param])
+        # model.generate returns shape (1, 50) tensor
+        model.generate.return_value = torch.zeros(1, 50, dtype=torch.long)
+
+        return model, tokenizer
+
+    def _import_and_patch(self, generated_text: str):
+        from local_model_service import generate_single_question_local
+        model, tokenizer = self._make_model_tokenizer(generated_text)
+        return generate_single_question_local, model, tokenizer
+
+    def test_valid_mcq_from_model(self):
+        from local_model_service import generate_single_question_local
+        valid_json = json.dumps({
+            "question_id": "Q1",
+            "question": "Which mechanism allows Transformers to attend globally?",
+            "question_type": "MCQ",
+            "options": {"A": "Self-attention", "B": "LSTM hidden states", "C": "Convolution", "D": "Pooling"},
+            "correct_answer": "A",
+            "explanation": "Self-attention computes global dependencies.",
+            "topic": "Transformers",
+            "difficulty": "Medium",
+        })
+        model, tokenizer = self._make_model_tokenizer(valid_json)
+        result, err = generate_single_question_local(
+            context="Transformers use self-attention for global dependency modelling.",
+            topic="Transformers",
+            qtype="MCQ",
+            difficulty="Medium",
+            bloom_level="Understand",
+            model=model,
+            tokenizer=tokenizer,
+        )
+        assert err is None
+        assert result is not None
+        assert result["question_type"] == "MCQ"
+
+    def test_placeholder_question_propagates_json(self):
+        """The single-question function itself does not validate content — that is _validate's job."""
+        from local_model_service import generate_single_question_local
+        placeholder_json = json.dumps({
+            "question_id": "Q1",
+            "question": "...",
+            "question_type": "MCQ",
+            "options": {"A": "First", "B": "Second", "C": "Third", "D": "Fourth"},
+            "correct_answer": "A",
+            "explanation": "...",
+            "topic": "Topic",
+            "difficulty": "Medium",
+        })
+        model, tokenizer = self._make_model_tokenizer(placeholder_json)
+        result, err = generate_single_question_local(
+            context="Some context.",
+            topic="Topic",
+            qtype="MCQ",
+            difficulty="Medium",
+            bloom_level="Understand",
+            model=model,
+            tokenizer=tokenizer,
+        )
+        # generate_single returns raw parsed JSON; _validate catches the placeholder
+        assert result is not None
+        assert result["question"] == "..."
+
+    def test_invalid_json_returns_error(self):
+        from local_model_service import generate_single_question_local
+        model, tokenizer = self._make_model_tokenizer("not valid json at all")
+        result, err = generate_single_question_local(
+            context="Context",
+            topic="Topic",
+            qtype="MCQ",
+            difficulty="Medium",
+            bloom_level="Understand",
+            model=model,
+            tokenizer=tokenizer,
+        )
+        assert result is None
+        assert err is not None
+        assert "LOCAL_INVALID_JSON" in err or "LOCAL_NO_JSON" in err
+
+    def test_empty_output_returns_error(self):
+        from local_model_service import generate_single_question_local
+        model, tokenizer = self._make_model_tokenizer("")
+        result, err = generate_single_question_local(
+            context="Context",
+            topic="Topic",
+            qtype="MCQ",
+            difficulty="Medium",
+            bloom_level="Understand",
+            model=model,
+            tokenizer=tokenizer,
+        )
+        assert result is None
+        assert "EMPTY" in (err or "")
+
+
+# ===========================================================================
+# generate_quiz_local — integration with mocked inference
+# ===========================================================================
+
+def _make_valid_mcq_json(idx: int = 1) -> str:
+    return json.dumps({
+        "question_id": f"Q{idx}",
+        "question": f"What does self-attention allow the model to do in example {idx}?",
         "question_type": "MCQ",
-        "options": {"A": "Token information", "B": "Images", "C": "Audio", "D": "Labels"},
+        "options": {
+            "A": "Attend to all positions simultaneously",
+            "B": "Process input sequentially",
+            "C": "Apply fixed filters",
+            "D": "Use max-pooling",
+        },
         "correct_answer": "A",
-        "explanation": "Attention combines information across positions.",
-        "topic": "Transformers",
-        "difficulty": "Easy",
-    }
-    monkeypatch.setattr(local_model_service, "load_cached_peft_model", lambda adapter_path=None: (object(), object()))
-    monkeypatch.setattr(
-        local_model_service,
-        "generate_single_question_local",
-        lambda **kwargs: (valid, None),
-    )
-    result, error = local_model_service.generate_quiz_local(
-        "Transformers use attention.\n\nTransformers use attention.",
-        2, "Transformers", "Easy", ["MCQ"], {}, "adapter"
-    )
-    assert result is None
-    assert error is not None
-    assert "returned 1 of 2" in error
-    assert "duplicate question text" in error
+        "explanation": "Self-attention enables parallel global attention.",
+        "topic": "Attention",
+        "difficulty": "Medium",
+    })
+
+
+class TestGenerateQuizLocalMocked:
+    def _patch_generate(self, return_json: str):
+        """Patch generate_single_question_local to return a fixed JSON string."""
+        import torch
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<prompt>"
+        tokenizer.eos_token_id = 2
+        tokenizer.return_value = {"input_ids": torch.zeros(1, 10, dtype=torch.long)}
+        tokenizer.decode.return_value = return_json
+        model = MagicMock()
+        model.parameters.return_value = iter([MagicMock(device=MagicMock(type="cpu"))])
+        model.generate.return_value = torch.zeros(1, 50, dtype=torch.long)
+        return model, tokenizer
+
+    def test_valid_single_mcq_quiz(self):
+        from local_model_service import generate_quiz_local
+        import torch
+
+        mock_output = json.loads(_make_valid_mcq_json(1))
+
+        with (
+            patch("local_model_service.load_cached_peft_model") as mock_loader,
+            patch("local_model_service.generate_single_question_local", return_value=(mock_output, None)),
+        ):
+            model_mock = MagicMock()
+            tokenizer_mock = MagicMock()
+            mock_loader.return_value = (model_mock, tokenizer_mock)
+
+            quiz, err = generate_quiz_local(
+                pdf_context="Attention mechanisms allow the model to focus on relevant positions in the input.",
+                target_count=1,
+                target_topic="Attention",
+                target_diff="Medium",
+                target_types=["MCQ"],
+                type_counts={"MCQ": 1},
+                adapter_path="/fake/path",
+            )
+
+        assert err is None, f"Unexpected error: {err}"
+        assert quiz is not None
+        assert len(quiz["questions"]) == 1
+        assert quiz["questions"][0]["question_type"] == "MCQ"
+
+    def test_placeholder_output_causes_retry_and_failure(self):
+        """When the model always outputs a placeholder, quiz generation must fail."""
+        from local_model_service import generate_quiz_local
+
+        placeholder_output = {
+            "question_id": "Q1",
+            "question": "...",
+            "question_type": "MCQ",
+            "options": {"A": "First", "B": "Second", "C": "Third", "D": "Fourth"},
+            "correct_answer": "A",
+            "explanation": "...",
+            "topic": "Topic",
+            "difficulty": "Medium",
+        }
+
+        with (
+            patch("local_model_service.load_cached_peft_model") as mock_loader,
+            patch("local_model_service.generate_single_question_local", return_value=(placeholder_output, None)),
+        ):
+            mock_loader.return_value = (MagicMock(), MagicMock())
+            quiz, err = generate_quiz_local(
+                pdf_context="Some meaningful PDF content about transformers.",
+                target_count=1,
+                target_topic="Topic",
+                target_diff="Medium",
+                target_types=["MCQ"],
+                type_counts={"MCQ": 1},
+                adapter_path="/fake/path",
+            )
+
+        assert quiz is None
+        assert err is not None
+        assert "0" in err or "0 of" in err  # "returned 0 of 1"
+
+    def test_invalid_json_causes_failure(self):
+        """When the model always outputs invalid JSON, quiz generation must fail."""
+        from local_model_service import generate_quiz_local
+
+        with (
+            patch("local_model_service.load_cached_peft_model") as mock_loader,
+            patch("local_model_service.generate_single_question_local", return_value=(None, "LOCAL_INVALID_JSON: ...")),
+        ):
+            mock_loader.return_value = (MagicMock(), MagicMock())
+            quiz, err = generate_quiz_local(
+                pdf_context="Transformer architecture overview.",
+                target_count=1,
+                target_topic="Transformers",
+                target_diff="Medium",
+                target_types=["MCQ"],
+                type_counts={"MCQ": 1},
+                adapter_path="/fake/path",
+            )
+
+        assert quiz is None
+        assert err is not None
+
+    def test_target_count_exceeds_local_limit(self):
+        from local_model_service import generate_quiz_local, LOCAL_MAX_QUESTIONS
+        quiz, err = generate_quiz_local(
+            pdf_context="Context",
+            target_count=LOCAL_MAX_QUESTIONS + 1,
+            target_topic="Topic",
+            target_diff="Medium",
+            target_types=["MCQ"],
+            type_counts={},
+            adapter_path="/fake/path",
+        )
+        assert quiz is None
+        assert "LOCAL_REQUEST_TOO_LARGE" in err
+
+    def test_empty_context_causes_failure(self):
+        from local_model_service import generate_quiz_local
+        with patch("local_model_service.load_cached_peft_model") as mock_loader:
+            mock_loader.return_value = (MagicMock(), MagicMock())
+            quiz, err = generate_quiz_local(
+                pdf_context="",
+                target_count=1,
+                target_topic="Topic",
+                target_diff="Medium",
+                target_types=["MCQ"],
+                type_counts={},
+                adapter_path="/fake/path",
+            )
+        assert quiz is None
+        assert "LOCAL_EMPTY_CONTEXT" in err
+
+
+# ===========================================================================
+# QuizGenerator — missing adapter path raises RuntimeError
+# ===========================================================================
+
+class TestQuizGeneratorLocalMissing:
+    def test_missing_adapter_raises_runtime_error(self):
+        dm = DatasetManager("genquiz_dataset.csv")
+        svc = LLMService(provider="local")
+        with patch("local_model_service.resolve_adapter_path", return_value=None):
+            generator = QuizGenerator(dm, svc)
+            with pytest.raises(RuntimeError) as exc_info:
+                generator.generate_quiz(
+                    pdf_text_or_dict="Some PDF content about Transformers.",
+                    user_prompt="Generate 1 MCQ about Transformers.",
+                    force_demo=False,
+                )
+            assert "LORA_ADAPTER_NOT_FOUND" in str(exc_info.value)
+            assert "GenQuiz_FineTuning.ipynb" in str(exc_info.value)

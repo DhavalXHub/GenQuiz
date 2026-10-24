@@ -17,7 +17,141 @@ import pandas as pd
 from pydantic import BaseModel, Field, field_validator
 from dataset import DatasetManager
 from llm_service import LLMService
-from pdf_processor import prioritize_topic_passages
+from pdf_processor import prioritize_topic_passages, check_topic_in_text
+
+
+class TopicMismatchError(ValueError):
+    """
+    Raised when the requested topic is completely unsupported by the uploaded PDF.
+    Prevents silent substitution of unrelated topics and protects question grounding.
+    """
+    def __init__(self, topic: str, warning: str):
+        super().__init__(warning)
+        self.topic = topic
+        self.warning = warning
+
+
+# Generic option placeholders that must be rejected
+_GENERIC_MCQ_OPTIONS_SET = frozenset([
+    "first", "second", "third", "fourth",
+    "option a", "option b", "option c", "option d",
+    "choice a", "choice b", "choice c", "choice d",
+    "<option>", "...", "…", "none", "n/a", ""
+])
+
+# Known cross-domain collision dictionaries to catch hallucinated answer keys
+_CROSS_DOMAIN_PAIRS = [
+    # (Domain A keywords, Domain B keywords, Domain A name, Domain B name)
+    (
+        {"cybercrime", "cyberterrorism", "cybersecurity", "malware", "phishing", "ransomware", "unauthorized access", "computer crime", "hacking", "firewall"},
+        {"positional encoding", "transformer", "self-attention", "multi-head attention", "encoder-decoder", "token embedding"},
+        "Cybersecurity",
+        "Transformers / NLP"
+    ),
+    (
+        {"sorting", "quicksort", "mergesort", "binary search", "linked list", "binary tree"},
+        {"positional encoding", "self-attention", "gradient descent", "backpropagation", "convolution"},
+        "Data Structures / Algorithms",
+        "Deep Learning"
+    ),
+]
+
+
+def validate_question_answer_alignment(
+    question: str,
+    correct_answer: str,
+    qtype: str,
+    options: Optional[Dict[str, str]] = None,
+    explanation: str = "",
+    context: Optional[str] = None
+) -> None:
+    """
+    Validates structural and semantic alignment between a question and its expected answer.
+
+    Raises ValueError when:
+    - Question or answer is empty or a placeholder.
+    - MCQ options are invalid, generic, duplicated, or correct_answer is not in A, B, C, D.
+    - True/False answer is not 'True' or 'False'.
+    - Short Answer:
+      * Question and answer exhibit an unambiguous domain contradiction (e.g., cybercrime
+        question paired with a transformer positional encoding answer).
+      * When context is provided: the answer introduces substantive technical concepts that
+        appear neither in the question nor anywhere in the source passage context.
+    """
+    q_clean = str(question).strip()
+    a_clean = str(correct_answer).strip()
+
+    if not q_clean or len(q_clean) < 10:
+        raise ValueError(f"Question text is too short or empty: '{q_clean}'")
+
+    if not a_clean:
+        raise ValueError("Correct answer cannot be empty.")
+
+    # 1. MCQ Validation
+    if qtype == "MCQ":
+        if not isinstance(options, dict) or set(options.keys()) != {"A", "B", "C", "D"}:
+            raise ValueError("MCQ options must be a dictionary with exactly keys 'A', 'B', 'C', and 'D'.")
+        
+        # Check for generic/placeholder options
+        for key in ("A", "B", "C", "D"):
+            opt_val = str(options.get(key, "")).strip().lower()
+            if opt_val in _GENERIC_MCQ_OPTIONS_SET or len(opt_val) < 2:
+                raise ValueError(f"MCQ option {key} is a generic placeholder: '{options.get(key)}'")
+
+        # Ensure all 4 options are distinct
+        distinct_vals = {str(options[k]).strip().lower() for k in ("A", "B", "C", "D")}
+        if len(distinct_vals) < 4:
+            raise ValueError("MCQ options must be distinct; duplicate options found.")
+
+        # Ensure correct_answer is one of A, B, C, D
+        if a_clean.upper() not in {"A", "B", "C", "D"}:
+            raise ValueError(f"MCQ correct_answer must be one of A, B, C, or D; got '{a_clean}'.")
+
+    # 2. True/False Validation
+    elif qtype == "True/False":
+        if a_clean.lower() not in {"true", "false"}:
+            raise ValueError(f"True/False correct_answer must be 'True' or 'False'; got '{a_clean}'.")
+
+    # 3. Short Answer Validation
+    elif qtype == "Short Answer":
+        if len(a_clean) < 2 or a_clean.lower() in {"...", "…", "none", "n/a", "placeholder"}:
+            raise ValueError(f"Short answer expected answer is too short or placeholder: '{a_clean}'")
+
+        q_lower = q_clean.lower()
+        a_lower = a_clean.lower()
+
+        # Check for cross-domain collision
+        for dom_a_keys, dom_b_keys, dom_a_name, dom_b_name in _CROSS_DOMAIN_PAIRS:
+            q_in_a = any(k in q_lower for k in dom_a_keys)
+            q_in_b = any(k in q_lower for k in dom_b_keys)
+            a_in_a = any(k in a_lower for k in dom_a_keys)
+            a_in_b = any(k in a_lower for k in dom_b_keys)
+
+            if q_in_a and not q_in_b and a_in_b and not a_in_a:
+                raise ValueError(
+                    f"Question-answer domain mismatch detected: Question discusses {dom_a_name} "
+                    f"('{q_clean[:60]}...'), but expected answer discusses {dom_b_name} ('{a_clean[:60]}...')."
+                )
+            if q_in_b and not q_in_a and a_in_a and not a_in_b:
+                raise ValueError(
+                    f"Question-answer domain mismatch detected: Question discusses {dom_b_name} "
+                    f"('{q_clean[:60]}...'), but expected answer discusses {dom_a_name} ('{a_clean[:60]}...')."
+                )
+
+        # Grounding check against context when context is provided
+        if context:
+            ctx_lower = str(context).lower()
+            # Extract substantive content tokens from answer (>= 4 chars, not common stop words)
+            stop = {"that", "this", "with", "from", "have", "were", "what", "which", "will", "when", "does", "been", "into", "more"}
+            a_words = [w for w in re.findall(r"\b[a-zA-Z]{4,}\b", a_lower) if w not in stop]
+            if len(a_words) >= 2:
+                # At least one substantive token must be found in question or context
+                has_overlap = any(w in q_lower or w in ctx_lower for w in a_words)
+                if not has_overlap:
+                    raise ValueError(
+                        f"Ungrounded answer: Expected answer '{a_clean}' has no conceptual overlap "
+                        f"with either the question ('{q_clean[:50]}...') or the source context."
+                    )
 
 
 class QuestionOption(BaseModel):
@@ -48,6 +182,23 @@ class GeneratedQuestion(BaseModel):
                 return "True/False"
             return "Short Answer"
         return v
+
+    @field_validator("question")
+    def validate_question_not_placeholder(cls, v):
+        """Reject placeholder question text such as '...', 'None', or empty strings."""
+        stripped = str(v).strip()
+        placeholder_values = {"...", "…", "<question>", "none", "n/a", ""}
+        if stripped.lower() in placeholder_values:
+            raise ValueError(
+                f"Question text '{stripped}' is a placeholder. "
+                "A real, specific question grounded in the source is required."
+            )
+        if len(stripped) < 10:
+            raise ValueError(
+                f"Question text is too short ({len(stripped)} chars): '{stripped}'. "
+                "A meaningful question of at least 10 characters is required."
+            )
+        return stripped
 
 
 class GeneratedQuiz(BaseModel):
@@ -91,11 +242,11 @@ def parse_user_prompt(prompt_text: str) -> Dict[str, Any]:
     count = 5
     count_match = re.search(r"\b(\d{1,2})\s*(?:questions|items|queries|qs)\b", cleaned)
     if count_match:
-        count = max(1, min(15, int(count_match.group(1))))
+        count = max(1, min(30, int(count_match.group(1))))
     else:
         gen_match = re.search(r"(?:generate|create|make|give me)\s+(\d{1,2})\b", cleaned)
         if gen_match:
-            count = max(1, min(15, int(gen_match.group(1))))
+            count = max(1, min(30, int(gen_match.group(1))))
         else:
             defaults_applied.append("count=5")
 
@@ -130,6 +281,12 @@ def parse_user_prompt(prompt_text: str) -> Dict[str, Any]:
     elif "true/false" in cleaned or "true false" in cleaned or "t/f" in cleaned or "boolean" in cleaned:
         if "True/False" not in question_types:
             question_types.append("True/False")
+
+    # If explicit type counts are specified, harmonize total count
+    if type_counts:
+        sum_types = sum(type_counts.values())
+        if sum_types > count or "count=5" in defaults_applied:
+            count = max(1, min(30, sum_types))
 
     if not question_types:
         question_types = ["MCQ", "True/False", "Short Answer"]
@@ -193,10 +350,11 @@ class QuizGenerator:
             "You are GenQuiz, an expert academic Generative AI quiz generation and assessment system.\n"
             "Your task is to create high-quality, pedagogically sound assessment questions.\n\n"
             "CRITICAL CONSTRAINTS:\n"
-            "1. GROUNDING: All questions MUST be strictly grounded in the provided PDF excerpt. Do not fabricate facts.\n"
-            "2. DATASET IN-CONTEXT EXAMPLES: The examples below illustrate the required formatting, clarity, and depth. "
-            "Do NOT copy example questions verbatim. Formulate brand new questions based solely on the uploaded PDF.\n"
-            "3. STRUCTURED JSON OUTPUT: You MUST return a single valid JSON object strictly matching this schema:\n"
+            "1. GROUNDING: All questions, answers, and explanations MUST be strictly grounded in the provided PDF excerpt. Do not fabricate facts.\n"
+            "2. DATASET IN-CONTEXT EXAMPLES: The examples below illustrate the required formatting, clarity, and depth ONLY. "
+            "Do NOT copy example questions, answers, or explanations. Formulate brand new questions and correct answers based solely on the uploaded PDF.\n"
+            "3. QUESTION-ANSWER COHERENCE: The correct_answer MUST specifically address the question asked. Never combine a question from the PDF with an answer from a different domain or example.\n"
+            "4. STRUCTURED JSON OUTPUT: You MUST return a single valid JSON object strictly matching this schema:\n"
             "{\n"
             '  "title": "Quiz Title",\n'
             '  "topic": "Topic Name",\n'
@@ -222,7 +380,8 @@ class QuizGenerator:
         self,
         pdf_text_or_dict: Any,
         user_prompt: str,
-        force_demo: bool = False
+        force_demo: bool = False,
+        progress_callback: Optional[Any] = None,
     ) -> GeneratedQuiz:
         """
         Main generation pipeline:
@@ -239,27 +398,16 @@ class QuizGenerator:
         target_diff = parsed_params["difficulty"]
         target_count = parsed_params["count"]
 
-        # Prioritize passages from PDF if full pdf_result dict is provided
-        topic_warning = None
-        if isinstance(pdf_text_or_dict, dict) and "page_texts" in pdf_text_or_dict:
-            prioritized_info = prioritize_topic_passages(pdf_text_or_dict, target_topic)
-            pdf_context_text = prioritized_info["prioritized_text"]
-            topic_warning = prioritized_info.get("warning")
-        else:
-            pdf_context_text = str(pdf_text_or_dict)
-
-        # Retrieve relevant dataset exemplars (strictly matching topic/type)
-        few_shot_examples = self.dataset_manager.get_few_shot_examples(
-            target_topic=target_topic if target_topic != "General PDF Content" else None,
-            target_types=target_types,
-            target_difficulty=target_diff,
-            limit=3
-        )
-        example_ids = [ex["question_id"] for ex in few_shot_examples]
-
         # Explicit Demo Mode check
         if force_demo:
-            return self._generate_demo_quiz(parsed_params, example_ids, topic_warning)
+            few_shot_examples = self.dataset_manager.get_few_shot_examples(
+                target_topic=target_topic if target_topic != "General PDF Content" else None,
+                target_types=target_types,
+                target_difficulty=target_diff,
+                limit=3
+            )
+            example_ids = [ex["question_id"] for ex in few_shot_examples]
+            return self._generate_demo_quiz(parsed_params, example_ids, None)
 
         # If live mode requested but no API key configured (or no local adapter), raise clear error
         if not self.llm_service.has_active_credentials():
@@ -278,21 +426,54 @@ class QuizGenerator:
                 "to evaluate with verified dataset records."
             )
 
+        # Prioritize passages from PDF if full pdf_result dict is provided
+        topic_warning = None
+        if isinstance(pdf_text_or_dict, dict) and "page_texts" in pdf_text_or_dict:
+            prioritized_info = prioritize_topic_passages(pdf_text_or_dict, target_topic)
+            if not prioritized_info["has_topic_match"]:
+                raise TopicMismatchError(
+                    topic=target_topic,
+                    warning=prioritized_info["warning"]
+                )
+            pdf_context_text = prioritized_info["prioritized_text"]
+            topic_warning = prioritized_info.get("warning")
+        else:
+            pdf_context_text = str(pdf_text_or_dict)
+            coverage = check_topic_in_text(pdf_context_text, target_topic)
+            if not coverage["has_match"]:
+                raise TopicMismatchError(
+                    topic=target_topic,
+                    warning=coverage["warning"]
+                )
+
+        # Retrieve relevant dataset exemplars (strictly matching topic/type)
+        few_shot_examples = self.dataset_manager.get_few_shot_examples(
+            target_topic=target_topic if target_topic != "General PDF Content" else None,
+            target_types=target_types,
+            target_difficulty=target_diff,
+            limit=3
+        )
+        example_ids = [ex["question_id"] for ex in few_shot_examples]
+
         # Generate via Local Fine-Tuned Model or Cloud LLM
+        partial_delivery_note = None
         if self.llm_service.provider == "local":
-            from local_model_service import generate_quiz_local, get_adapter_status
+            from local_model_service import generate_quiz_local_batched, get_adapter_status
             status = get_adapter_status()
-            parsed_json, error_msg = generate_quiz_local(
+            parsed_json, error_msg = generate_quiz_local_batched(
                 pdf_context=pdf_context_text,
                 target_count=target_count,
                 target_topic=target_topic,
                 target_diff=target_diff,
                 target_types=target_types,
                 type_counts=type_counts,
-                adapter_path=status["adapter_path"]
+                adapter_path=status["adapter_path"],
+                progress_callback=progress_callback,
             )
-            if error_msg or not parsed_json:
+            if not parsed_json:
                 raise RuntimeError(f"Fine-Tuned Local Model quiz generation failed: {error_msg}")
+            if error_msg:
+                partial_delivery_note = error_msg
         else:
             # Build prompt instructions for Cloud LLM
             type_breakdown_str = ""
@@ -327,6 +508,7 @@ class QuizGenerator:
         try:
             questions_data = parsed_json.get("questions", [])
             raw_validated: List[GeneratedQuestion] = []
+            skipped_invalid: List[str] = []
 
             for i, q in enumerate(questions_data, 1):
                 qid = q.get("question_id") or f"Q{i}"
@@ -337,13 +519,11 @@ class QuizGenerator:
                     if isinstance(opts, list) and len(opts) >= 4:
                         opts = {"A": opts[0], "B": opts[1], "C": opts[2], "D": opts[3]}
                     elif not isinstance(opts, dict) or len(opts) < 4:
-                        # Ensure 4 complete options
-                        opts = {
-                            "A": str(q.get("correct_answer", "Option A")),
-                            "B": "Plausible alternative distractor B",
-                            "C": "Plausible alternative distractor C",
-                            "D": "Plausible alternative distractor D"
-                        }
+                        # Cannot silently invent MCQ options — skip this question
+                        skipped_invalid.append(
+                            f"{qid}: MCQ options missing or incomplete — skipped"
+                        )
+                        continue
                 else:
                     opts = None
 
@@ -357,23 +537,52 @@ class QuizGenerator:
                     if ans.upper() in ["A", "B", "C", "D"]:
                         ans = ans.upper()
                     else:
-                        ans = "A"
+                        skipped_invalid.append(
+                            f"{qid}: MCQ correct_answer '{ans}' is not a valid option letter — skipped"
+                        )
+                        continue
 
                 elif qtype == "True/False":
                     ans = "True" if "true" in ans.lower() else "False"
 
-                validated_q = GeneratedQuestion(
-                    question_id=qid,
-                    question=str(q.get("question", "")).strip(),
-                    question_type=qtype,
-                    options=opts,
-                    correct_answer=ans,
-                    explanation=str(q.get("explanation", "Grounded in uploaded document context.")).strip(),
-                    topic=str(q.get("topic", target_topic)),
-                    difficulty=str(q.get("difficulty", target_diff)),
-                    is_saved_dataset=False
+                try:
+                    q_text = str(q.get("question", "")).strip()
+                    q_expl = str(q.get("explanation", "")).strip() or "See source document."
+                    validate_question_answer_alignment(
+                        question=q_text,
+                        correct_answer=ans,
+                        qtype=qtype,
+                        options=opts,
+                        explanation=q_expl,
+                        context=pdf_context_text
+                    )
+                    validated_q = GeneratedQuestion(
+                        question_id=qid,
+                        question=q_text,
+                        question_type=qtype,
+                        options=opts,
+                        correct_answer=ans,
+                        explanation=q_expl,
+                        topic=str(q.get("topic", target_topic)),
+                        difficulty=str(q.get("difficulty", target_diff)),
+                        is_saved_dataset=False,
+                    )
+                    raw_validated.append(validated_q)
+                except Exception as pydantic_err:
+                    skipped_invalid.append(f"{qid}: validation failed — {pydantic_err}")
+
+            if skipped_invalid:
+                import logging
+                logging.warning(
+                    "Some questions were skipped during validation: %s",
+                    "; ".join(skipped_invalid),
                 )
-                raw_validated.append(validated_q)
+
+            if not raw_validated:
+                raise ValueError(
+                    f"Generated quiz output failed validation: 0 valid questions produced. "
+                    f"Errors: {'; '.join(skipped_invalid)}"
+                )
 
             # Harmonize questions to enforce exact requested count and type proportions
             validated_questions = self._harmonize_questions(
@@ -389,6 +598,8 @@ class QuizGenerator:
                 f"Delivered: {len(validated_questions)} validated questions",
                 f"Document grounding: Anchored in {len(pdf_context_text)} characters of extracted text."
             ]
+            if partial_delivery_note:
+                validation_notes.append(f"Batch Delivery Notice: {partial_delivery_note}")
             if topic_warning:
                 validation_notes.append(f"Grounding Notice: {topic_warning}")
 

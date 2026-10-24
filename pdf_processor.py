@@ -151,6 +151,104 @@ def extract_text_from_pdf(
         }
 
 
+# Domain-related terminology mapping for semantic topic expansion
+_TOPIC_DOMAIN_SYNONYMS: Dict[str, List[str]] = {
+    "transformer": ["attention", "self-attention", "multi-head", "encoder", "decoder", "positional encoding", "bert", "gpt", "sequence-to-sequence"],
+    "transformers": ["attention", "self-attention", "multi-head", "encoder", "decoder", "positional encoding", "bert", "gpt", "sequence-to-sequence"],
+    "attention": ["self-attention", "multi-head", "query", "key", "value", "transformer"],
+    "cybercrime": ["cyber", "malware", "phishing", "ransomware", "cybersecurity", "cyberterrorism", "fraud", "hacker", "unauthorized access", "computer crime"],
+    "cybersecurity": ["cyber", "malware", "phishing", "ransomware", "cybercrime", "firewall", "encryption", "vulnerability", "intrusion", "threat"],
+    "deep learning": ["neural network", "backpropagation", "gradient", "activation function", "weights", "bias", "loss function", "epoch"],
+    "neural network": ["deep learning", "perceptron", "backpropagation", "neuron", "layer", "weights", "activation"],
+    "diffusion": ["denoising", "score-based", "ddpm", "forward process", "reverse process", "gaussian noise"],
+    "reinforcement learning": ["agent", "environment", "reward", "policy", "q-learning", "markov", "action-value"],
+    "computer vision": ["convolution", "cnn", "pooling", "image classification", "object detection", "filter"],
+    "nlp": ["natural language processing", "tokenizer", "token", "embedding", "corpus", "vocabulary", "language model"],
+    "database": ["sql", "relational", "query", "schema", "table", "transaction", "index", "normalization"],
+}
+
+_TOPIC_STOPWORDS = frozenset([
+    "about", "the", "and", "for", "with", "from", "in", "on", "of", "to", "a", "an",
+    "this", "pdf", "document", "questions", "question", "quiz", "content", "covering",
+    "regarding", "topic", "using", "use", "based", "give", "generate", "include"
+])
+
+
+def get_topic_related_terms(topic: str) -> List[str]:
+    """
+    Extract substantive keywords, stems, and domain synonyms for a requested topic.
+    Avoids false mismatches when legitimate synonyms or related technical terms exist.
+    """
+    cleaned = topic.strip().lower()
+    tokens = re.findall(r"\b[a-zA-Z0-9-]+\b", cleaned)
+    terms = set()
+
+    for tok in tokens:
+        if len(tok) >= 3 and tok not in _TOPIC_STOPWORDS:
+            terms.add(tok)
+            # Add singular form if plural
+            if tok.endswith("s") and len(tok) > 4:
+                terms.add(tok[:-1])
+            if tok.endswith("es") and len(tok) > 5:
+                terms.add(tok[:-2])
+            if tok.endswith("ing") and len(tok) > 5:
+                terms.add(tok[:-3])
+
+    # Check domain synonyms dictionary
+    for key, syn_list in _TOPIC_DOMAIN_SYNONYMS.items():
+        if key in cleaned or any(tok in key for tok in tokens if len(tok) >= 4):
+            for syn in syn_list:
+                terms.add(syn.lower())
+
+    return sorted(list(terms))
+
+
+def check_topic_in_text(text: str, topic: str) -> Dict[str, Any]:
+    """
+    Check if a topic (or its related terminology) is present in arbitrary text.
+    Returns dict with 'has_match', 'match_count', 'matched_terms', and 'warning'.
+    """
+    cleaned_topic = topic.strip().lower()
+    if cleaned_topic in ["", "general pdf content", "extracted pdf subject", "all"]:
+        return {
+            "has_match": True,
+            "match_count": 0,
+            "matched_terms": [],
+            "warning": None
+        }
+
+    terms = get_topic_related_terms(topic)
+    text_lower = text.lower()
+    total_matches = 0
+    matched_terms = []
+
+    for term in terms:
+        cnt = len(re.findall(r"\b" + re.escape(term) + r"\b", text_lower))
+        if cnt > 0:
+            total_matches += cnt
+            matched_terms.append(term)
+
+    if total_matches == 0:
+        warning_msg = (
+            f"The uploaded document does not appear to contain mentions of '{topic}' "
+            "(0 keyword matches found across all pages). Questions will be grounded strictly in the available "
+            "document text, but may not reflect your desired topic."
+        )
+        return {
+            "has_match": False,
+            "match_count": 0,
+            "matched_terms": [],
+            "warning": warning_msg
+        }
+
+    return {
+        "has_match": True,
+        "match_count": total_matches,
+        "matched_terms": matched_terms,
+        "warning": None
+    }
+
+
 def prioritize_topic_passages(
     pdf_result: Dict[str, Any],
     topic: str,
@@ -183,20 +281,8 @@ def prioritize_topic_passages(
             "warning": None
         }
 
-    # Generate topic keywords & stems (e.g. 'transformers' -> ['transformers', 'transformer', 'attention'])
-    raw_tokens = re.findall(r"\b[a-zA-Z0-9-]+\b", cleaned_topic)
-    keywords = set()
-    for tok in raw_tokens:
-        if len(tok) >= 3:
-            keywords.add(tok)
-            # Add singular / stem if plural
-            if tok.endswith("s") and len(tok) > 4:
-                keywords.add(tok[:-1])
-
-    # If topic is related to transformers, include attention keywords
-    if any("transform" in k for k in keywords):
-        keywords.add("attention")
-        keywords.add("self-attention")
+    # Generate topic keywords & stems & domain terms
+    keywords = get_topic_related_terms(topic)
 
     # Score each page by keyword density
     page_scores = []
@@ -205,8 +291,8 @@ def prioritize_topic_passages(
         p_text_lower = p["text"].lower()
         score = 0
         for kw in keywords:
-            # Count word matches
-            matches = len(re.findall(re.escape(kw), p_text_lower))
+            # Count word matches with boundary
+            matches = len(re.findall(r"\b" + re.escape(kw) + r"\b", p_text_lower))
             score += matches
         total_matches += score
         page_scores.append({
